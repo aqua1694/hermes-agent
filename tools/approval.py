@@ -695,11 +695,11 @@ def _format_tirith_description(tirith_result: dict) -> str:
 # a generic Chinese wrapper around the English finding text.
 _TIRITH_RULE_CN: dict[str, dict] = {
     "pipe_to_interpreter": {
-        "what": "将命令输出直接管道传入 Python 解释器执行",
-        "why": "需要对 API 返回的 JSON 数据进行解析和格式化",
-        "scope": "Python 解释器进程；执行来自网络的数据内容",
-        "risk": "如果 API 返回恶意代码，将被直接执行，可能导致任意代码执行（RCE）",
-        "safer": "改用 `tirith run <URL>` 或先将数据保存到文件、检查内容后再处理",
+        "what": "把上一条命令的输出直接交给 Python 或 shell 当代码运行",
+        "why": "通常是为了快速处理命令输出或接口返回的数据",
+        "scope": "当前 Python/shell 进程；如果输入来自网络，也会把网络内容带进执行链路",
+        "risk": "如果前一段输出被污染，后面的解释器可能把它当代码执行，风险很高",
+        "safer": "先把输出保存到文件，确认内容只是数据，再用脚本读取文件处理",
     },
     "terminal_injection": {
         "what": "命令中包含可能被注入的终端控制序列",
@@ -748,11 +748,11 @@ _DANGEROUS_PATTERN_CN: dict[str, dict] = {
         "safer": "先下载到本地文件，检查内容后再执行",
     },
     "script execution via -e/-c flag": {
-        "what": "通过 -e 或 -c 参数直接执行脚本代码",
-        "why": "需要运行内联脚本来处理数据",
-        "scope": "对应解释器（Python/Perl/Ruby/Node）进程",
-        "risk": "脚本内容未经文件系统隔离，若输入被污染可导致任意代码执行",
-        "safer": "将脚本写入临时文件后再执行，便于审查和调试",
+        "what": "运行一段直接写在命令里的临时脚本",
+        "why": "通常是为了快速做检查、解析数据或验证 Python 模块是否能导入",
+        "scope": "这次 Python/Node 等解释器进程；如果脚本里读写文件或联网，也会影响对应文件和网络目标",
+        "risk": "脚本直接从命令行执行，安全系统不容易像审查独立文件那样逐行确认；如果内容被拼接或污染，可能执行非预期代码",
+        "safer": "复杂脚本先写成临时文件，确认内容后再运行；简单 import/状态检查可 Allow Once",
     },
     "world/other-writable permissions": {
         "what": "设置文件为全局可写权限（777/666/o+w）",
@@ -838,56 +838,57 @@ def _format_chinese_approval_description(
     dangerous_desc: str | None = None,
     dangerous_key: str | None = None,
 ) -> str:
-    """Build a Chinese approval description following USER.md's 5-element format.
+    """Build a plain Chinese approval description.
 
-    Elements:
-    1. 操作含义（做什么）
-    2. 目的与必要性（为什么）
-    3. 涉及范围
-    4. 风险说明
-    5. 替代方案/最小权限建议
+    Keep the required safety elements from USER.md, but phrase them like a
+    human operator instead of exposing scanner jargon as the main content.
     """
-    # Gather risk info from both sources
     cn_info = {}
     if tirith_result and tirith_result.get("action") in ("block", "warn"):
         cn_info = _get_cn_risk_for_tirith(tirith_result)
     if not cn_info and dangerous_key:
         cn_info = _get_cn_risk_for_pattern(dangerous_key)
 
-    # Build the command preview (first 120 chars)
-    cmd_preview = command if len(command) <= 120 else command[:117] + "..."
+    what = cn_info.get("what", "执行这条终端命令")
+    why = cn_info.get("why", _infer_operation_purpose(command))
+    scope = cn_info.get("scope", "当前服务器环境，以及命令实际读写到的文件、网络或进程")
+    risk = cn_info.get("risk", "安全扫描认为这条命令可能带来风险，需要你确认它符合预期")
+    safer = cn_info.get("safer")
 
-    if cn_info:
-        # We have localized info — build structured Chinese description
-        lines = [
-            f"📋 操作：{cn_info.get('what', '执行系统命令')}",
-            f"🎯 目的：{cn_info.get('why', _infer_operation_purpose(command))}",
-            f"📁 范围：{cn_info.get('scope', '当前系统环境')}",
-            f"⚠️ 风险：{cn_info.get('risk', '存在安全风险，请确认命令内容')}",
-        ]
-        if cn_info.get("safer"):
-            lines.append(f"💡 建议：{cn_info['safer']}")
-        return "\n".join(lines)
-    else:
-        # No localized match — build generic Chinese wrapper with English details
-        purpose = _infer_operation_purpose(command)
-        lines = [
-            f"📋 操作：执行命令（详见下方技术检测结果）",
-            f"🎯 目的：{purpose}",
-            f"📁 范围：当前系统环境及命令涉及的文件/网络资源",
-        ]
-
-        # Include English findings as supplementary info
+    if not cn_info:
         if tirith_result and tirith_result.get("findings"):
-            en_detail = _format_tirith_description(tirith_result)
-            lines.append(f"⚠️ 风险：{en_detail}")
+            technical_detail = _format_tirith_description(tirith_result)
         elif dangerous_desc:
-            lines.append(f"⚠️ 风险：{dangerous_desc}")
+            technical_detail = dangerous_desc
         else:
-            lines.append("⚠️ 风险：命令被安全扫描标记，请确认内容是否安全")
+            technical_detail = "命令被安全扫描标记。"
+    else:
+        technical_detail = None
 
-        lines.append("💡 建议：确认命令来源和内容后再批准；如不确定请选择「拒绝」")
-        return "\n".join(lines)
+    lines = [
+        "我需要你确认这条命令能不能执行。",
+        "",
+        f"我要做什么：{what}。",
+        f"为什么要做：{why}。",
+        f"会影响哪里：{scope}。",
+        f"主要风险：{risk}。",
+    ]
+
+    if technical_detail:
+        lines.append(f"安全扫描补充：{technical_detail}")
+
+    if safer:
+        lines.append(f"更稳妥的做法：{safer}。")
+
+    lines.extend([
+        "",
+        "我的建议：",
+        "- 如果这正是我刚才说明要做的检查或修改，选 Allow Once。",
+        "- 如果接下来要连续执行同类命令，且你信任这轮操作，选 Allow Session。",
+        "- 如果命令和你的预期不一致，或者你看不懂它会影响什么，选 Deny。",
+    ])
+
+    return "\n".join(lines)
 
 
 def check_all_command_guards(command: str, env_type: str,
