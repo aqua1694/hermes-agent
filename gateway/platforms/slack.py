@@ -1242,9 +1242,9 @@ class SlackAdapter(BasePlatformAdapter):
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f":warning: *Command Approval Required*\n"
+                            f":warning: *需要审批敏感操作*\n"
                             f"```{cmd_preview}```\n"
-                            f"Reason: {description}"
+                            f"安全审查说明：\n{description}"
                         ),
                     },
                 },

@@ -1209,9 +1209,9 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
             text = (
-                f"⚠️ <b>Command Approval Required</b>\n\n"
+                f"⚠️ <b>需要审批敏感操作</b>\n\n"
                 f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
-                f"Reason: {_html.escape(description)}"
+                f"安全审查说明：\n{_html.escape(description)}"
             )
 
             # Resolve thread context for thread replies

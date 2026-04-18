@@ -686,6 +686,210 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Chinese approval description (USER.md required format)
+# ---------------------------------------------------------------------------
+
+# Tirith rule_id → Chinese risk explanation mapping.
+# Covers the most common tirith findings; unknown rules fall back to
+# a generic Chinese wrapper around the English finding text.
+_TIRITH_RULE_CN: dict[str, dict] = {
+    "pipe_to_interpreter": {
+        "what": "将命令输出直接管道传入 Python 解释器执行",
+        "why": "需要对 API 返回的 JSON 数据进行解析和格式化",
+        "scope": "Python 解释器进程；执行来自网络的数据内容",
+        "risk": "如果 API 返回恶意代码，将被直接执行，可能导致任意代码执行（RCE）",
+        "safer": "改用 `tirith run <URL>` 或先将数据保存到文件、检查内容后再处理",
+    },
+    "terminal_injection": {
+        "what": "命令中包含可能被注入的终端控制序列",
+        "why": "动态拼接了用户或外部输入到命令字符串中",
+        "scope": "当前终端会话",
+        "risk": "注入的命令可能执行任意操作，包括删除文件、提权等",
+        "safer": "使用参数化方式传递变量，避免字符串拼接",
+    },
+    "homograph_url": {
+        "what": "命令中包含使用 Unicode 混淆字符构造的可疑 URL",
+        "why": "URL 中包含视觉相似但字节不同的字符（如西里尔字母 а 代替拉丁字母 a）",
+        "scope": "网络请求目标",
+        "risk": "可能被钓鱼攻击利用，将请求发送到恶意服务器",
+        "safer": "检查并使用纯 ASCII 的正确域名",
+    },
+}
+
+# Dangerous pattern description → Chinese risk explanation mapping.
+_DANGEROUS_PATTERN_CN: dict[str, dict] = {
+    "recursive delete": {
+        "what": "递归删除文件或目录",
+        "why": "需要清理指定路径下的文件",
+        "scope": "目标目录及其所有子目录和文件",
+        "risk": "不可逆删除，数据无法恢复；路径错误可能误删重要文件",
+        "safer": "先用 `ls` 确认目标路径，考虑用 `trash` 代替 `rm`",
+    },
+    "recursive delete (long flag)": {
+        "what": "递归删除文件或目录（长参数格式）",
+        "why": "需要清理指定路径下的文件",
+        "scope": "目标目录及其所有子目录和文件",
+        "risk": "不可逆删除，数据无法恢复",
+        "safer": "先用 `ls` 确认目标路径，考虑用 `trash` 代替 `rm`",
+    },
+    "delete in root path": {
+        "what": "在根路径下执行删除操作",
+        "why": "需要删除系统级路径下的文件",
+        "scope": "系统根目录或其子路径",
+        "risk": "极高风险，可能破坏系统文件导致服务不可用",
+        "safer": "确认具体目标路径，使用最小范围的删除",
+    },
+    "pipe remote content to shell": {
+        "what": "从远程服务器下载内容并直接通过 shell 执行",
+        "why": "需要安装或运行远程脚本",
+        "scope": "系统 shell，执行来自网络的任意代码",
+        "risk": "远程内容被篡改时将执行恶意代码，等同于远程代码执行（RCE）",
+        "safer": "先下载到本地文件，检查内容后再执行",
+    },
+    "script execution via -e/-c flag": {
+        "what": "通过 -e 或 -c 参数直接执行脚本代码",
+        "why": "需要运行内联脚本来处理数据",
+        "scope": "对应解释器（Python/Perl/Ruby/Node）进程",
+        "risk": "脚本内容未经文件系统隔离，若输入被污染可导致任意代码执行",
+        "safer": "将脚本写入临时文件后再执行，便于审查和调试",
+    },
+    "world/other-writable permissions": {
+        "what": "设置文件为全局可写权限（777/666/o+w）",
+        "why": "需要让其他用户/进程访问该文件",
+        "scope": "目标文件的权限设置",
+        "risk": "任何用户都可修改此文件，存在被植入恶意代码的风险",
+        "safer": "使用更精确的权限设置（如 755/644），或用组权限控制",
+    },
+    "stop/disable system service": {
+        "what": "停止或禁用系统服务",
+        "why": "需要修改系统服务运行状态",
+        "scope": "systemd 管理的系统服务",
+        "risk": "停止关键服务可能导致系统功能异常或安全防护失效",
+        "safer": "确认服务名称和影响范围，使用 restart 代替 stop",
+    },
+}
+
+
+def _infer_operation_purpose(command: str) -> str:
+    """Infer the purpose of a command from its structure for Chinese context."""
+    cmd_lower = command.lower().strip()
+
+    # API data fetching patterns
+    if "api." in cmd_lower and ("curl" in cmd_lower or "wget" in cmd_lower):
+        if "python" in cmd_lower or "json" in cmd_lower:
+            return "调用 API 获取数据并用脚本解析处理"
+        return "通过 HTTP 请求获取远程数据"
+
+    # File reading
+    if cmd_lower.startswith("cat ") or cmd_lower.startswith("less ") or cmd_lower.startswith("head "):
+        return "读取文件内容"
+
+    # JSON processing
+    if "json.load" in cmd_lower or "json.loads" in cmd_lower:
+        return "解析 JSON 数据"
+
+    # Data pipeline
+    if "|" in cmd_lower:
+        return "通过管道组合多个工具处理数据"
+
+    return "执行系统命令"
+
+
+def _get_cn_risk_for_pattern(pattern_key: str) -> dict:
+    """Get Chinese risk explanation for a dangerous pattern key."""
+    # Direct match
+    if pattern_key in _DANGEROUS_PATTERN_CN:
+        return _DANGEROUS_PATTERN_CN[pattern_key]
+
+    # Fuzzy match: check if any known key is a substring
+    for known_key, info in _DANGEROUS_PATTERN_CN.items():
+        if known_key in pattern_key or pattern_key in known_key:
+            return info
+
+    return {}
+
+
+def _get_cn_risk_for_tirith(tirith_result: dict) -> dict:
+    """Get Chinese risk explanation for tirith findings."""
+    findings = tirith_result.get("findings") or []
+    if not findings:
+        return {}
+
+    rule_id = findings[0].get("rule_id", "")
+    if rule_id in _TIRITH_RULE_CN:
+        return _TIRITH_RULE_CN[rule_id]
+
+    # Check for pipe_to_interpreter by title/description
+    for f in findings:
+        title = (f.get("title") or "").lower()
+        desc = (f.get("description") or "").lower()
+        if "pipe" in title and "interpreter" in title:
+            return _TIRITH_RULE_CN.get("pipe_to_interpreter", {})
+        if "pipe" in desc and "interpreter" in desc:
+            return _TIRITH_RULE_CN.get("pipe_to_interpreter", {})
+
+    return {}
+
+
+def _format_chinese_approval_description(
+    command: str,
+    tirith_result: dict | None = None,
+    dangerous_desc: str | None = None,
+    dangerous_key: str | None = None,
+) -> str:
+    """Build a Chinese approval description following USER.md's 5-element format.
+
+    Elements:
+    1. 操作含义（做什么）
+    2. 目的与必要性（为什么）
+    3. 涉及范围
+    4. 风险说明
+    5. 替代方案/最小权限建议
+    """
+    # Gather risk info from both sources
+    cn_info = {}
+    if tirith_result and tirith_result.get("action") in ("block", "warn"):
+        cn_info = _get_cn_risk_for_tirith(tirith_result)
+    if not cn_info and dangerous_key:
+        cn_info = _get_cn_risk_for_pattern(dangerous_key)
+
+    # Build the command preview (first 120 chars)
+    cmd_preview = command if len(command) <= 120 else command[:117] + "..."
+
+    if cn_info:
+        # We have localized info — build structured Chinese description
+        lines = [
+            f"📋 操作：{cn_info.get('what', '执行系统命令')}",
+            f"🎯 目的：{cn_info.get('why', _infer_operation_purpose(command))}",
+            f"📁 范围：{cn_info.get('scope', '当前系统环境')}",
+            f"⚠️ 风险：{cn_info.get('risk', '存在安全风险，请确认命令内容')}",
+        ]
+        if cn_info.get("safer"):
+            lines.append(f"💡 建议：{cn_info['safer']}")
+        return "\n".join(lines)
+    else:
+        # No localized match — build generic Chinese wrapper with English details
+        purpose = _infer_operation_purpose(command)
+        lines = [
+            f"📋 操作：执行命令（详见下方技术检测结果）",
+            f"🎯 目的：{purpose}",
+            f"📁 范围：当前系统环境及命令涉及的文件/网络资源",
+        ]
+
+        # Include English findings as supplementary info
+        if tirith_result and tirith_result.get("findings"):
+            en_detail = _format_tirith_description(tirith_result)
+            lines.append(f"⚠️ 风险：{en_detail}")
+        elif dangerous_desc:
+            lines.append(f"⚠️ 风险：{dangerous_desc}")
+        else:
+            lines.append("⚠️ 风险：命令被安全扫描标记，请确认内容是否安全")
+
+        lines.append("💡 建议：确认命令来源和内容后再批准；如不确定请选择「拒绝」")
+        return "\n".join(lines)
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
@@ -783,8 +987,15 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --- Phase 3: Approval ---
 
-    # Combine descriptions for a single approval prompt
-    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    # Build Chinese approval description (USER.md: 5-element format)
+    # Keep English descriptions in `warnings` for smart approval and internal use;
+    # use Chinese description for user-facing approval prompt.
+    combined_desc = _format_chinese_approval_description(
+        command=command,
+        tirith_result=tirith_result if tirith_result.get("action") in ("block", "warn") else None,
+        dangerous_desc=description if is_dangerous else None,
+        dangerous_key=pattern_key if is_dangerous else None,
+    )
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
