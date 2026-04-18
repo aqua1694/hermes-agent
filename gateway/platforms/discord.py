@@ -581,10 +581,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     if allow_bots == "none":
                         return
                     elif allow_bots == "mentions":
-                        if not self._client.user or self._client.user not in message.mentions:
+                        if not self._message_mentions_user(message, self._client.user):
                             return
                     # "all" falls through to handle_message
-                
+
                 # Multi-agent filtering: if the message mentions specific bots
                 # but NOT this bot, the sender is talking to another agent —
                 # stay silent.  Messages with no bot mentions (general chat)
@@ -595,10 +595,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # with bot-aware filtering that works correctly when multiple
                 # agents share a channel.
                 if not isinstance(message.channel, discord.DMChannel) and message.mentions:
-                    _self_mentioned = (
-                        self._client.user is not None
-                        and self._client.user in message.mentions
-                    )
+                    _self_mentioned = self._message_mentions_user(message, self._client.user)
                     _other_bots_mentioned = any(
                         m.bot and m != self._client.user
                         for m in message.mentions
@@ -615,6 +612,29 @@ class DiscordAdapter(BasePlatformAdapter):
                         return
 
                 await self._handle_message(message)
+
+            @self._client.event
+            async def on_thread_create(thread: discord.Thread):
+                """Best-effort auto-join for newly created threads.
+
+                New private threads may not emit message events to the bot unless it
+                is explicitly a thread member. Joining here keeps @mentions responsive
+                in freshly created project threads.
+                """
+                try:
+                    await thread.join()
+                    adapter_self._track_thread(str(thread.id))
+                    logger.info("[%s] Joined new thread: %s (%s)", adapter_self.name, getattr(thread, "name", "thread"), thread.id)
+                except Exception as e:
+                    logger.debug("[%s] Could not auto-join thread %s: %s", adapter_self.name, getattr(thread, "id", "?"), e)
+
+            @self._client.event
+            async def on_thread_join(thread: discord.Thread):
+                """Track joined threads so follow-up messages don't require @mention."""
+                try:
+                    adapter_self._track_thread(str(thread.id))
+                except Exception:
+                    pass
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -2066,11 +2086,13 @@ class DiscordAdapter(BasePlatformAdapter):
             max_desc = 4088
             cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
             embed = discord.Embed(
-                title="⚠️ Command Approval Required",
+                title="⚠️ 需要审批敏感操作",
                 description=f"```\n{cmd_display}\n```",
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Reason", value=description, inline=False)
+            # Discord field value limit is 1024; truncate if needed
+            desc_value = description if len(description) <= 1020 else description[:1017] + "..."
+            embed.add_field(name="安全审查说明", value=desc_value, inline=False)
 
             view = ExecApprovalView(
                 session_key=session_key,
@@ -2223,6 +2245,114 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"{parent_name} / {thread_name}"
         return thread_name
 
+
+    # ------------------------------------------------------------------
+    # Thread participation persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _thread_state_path() -> Path:
+        """Path to the persisted thread participation set."""
+        from hermes_cli.config import get_hermes_home
+        return get_hermes_home() / "discord_threads.json"
+
+    @classmethod
+    def _load_participated_threads(cls) -> set:
+        """Load persisted thread IDs from disk."""
+        path = cls._thread_state_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return set(data)
+        except Exception as e:
+            logger.debug("Could not load discord thread state: %s", e)
+        return set()
+
+    def _save_participated_threads(self) -> None:
+        """Persist the current thread set to disk (best-effort)."""
+        path = self._thread_state_path()
+        try:
+            # Trim to most recent entries if over cap
+            thread_list = list(self._bot_participated_threads)
+            if len(thread_list) > self._MAX_TRACKED_THREADS:
+                thread_list = thread_list[-self._MAX_TRACKED_THREADS:]
+                self._bot_participated_threads = set(thread_list)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(thread_list), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Could not save discord thread state: %s", e)
+
+    def _track_thread(self, thread_id: str) -> None:
+        """Add a thread to the participation set and persist."""
+        if thread_id not in self._bot_participated_threads:
+            self._bot_participated_threads.add(thread_id)
+            self._save_participated_threads()
+
+    def _message_mentions_user(self, message: Any, user: Any) -> bool:
+        """Return True if a Discord message mentions ``user``.
+
+        Prefer structured mention metadata (``message.mentions`` / ``raw_mentions``),
+        then fall back to scanning mention tokens in message content.
+        """
+        if message is None or user is None:
+            return False
+
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            return False
+        user_id_str = str(user_id)
+
+        for mentioned in getattr(message, "mentions", None) or []:
+            if str(getattr(mentioned, "id", "")) == user_id_str:
+                return True
+
+        raw_mentions = getattr(message, "raw_mentions", None) or []
+        if raw_mentions:
+            try:
+                if int(user_id) in {int(mid) for mid in raw_mentions}:
+                    return True
+            except Exception:
+                pass
+
+        content = getattr(message, "content", "") or ""
+        return bool(re.search(rf"<@!?{re.escape(user_id_str)}>", content))
+
+    def _message_mentions_bot_role(self, message: Any) -> bool:
+        """Return True when a message mentions any Discord role assigned to this bot.
+
+        This catches role pings like ``<@&ROLE_ID>`` that users often treat as
+        "@the bot" in project threads.
+        """
+        if message is None or not self._client or not self._client.user:
+            return False
+
+        guild = getattr(message, "guild", None)
+        bot_member = getattr(guild, "me", None) if guild else None
+        if bot_member is None:
+            return False
+
+        bot_role_ids = {
+            str(getattr(role, "id", ""))
+            for role in (getattr(bot_member, "roles", None) or [])
+            if getattr(role, "id", None) is not None
+        }
+        if not bot_role_ids:
+            return False
+
+        for role in getattr(message, "role_mentions", None) or []:
+            if str(getattr(role, "id", "")) in bot_role_ids:
+                return True
+
+        # Fallback for partial/mocked Discord objects where role_mentions is empty.
+        content = getattr(message, "content", "") or ""
+        for rid in bot_role_ids:
+            if rid and f"<@&{rid}>" in content:
+                return True
+
+        return False
+
+
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -2282,11 +2412,16 @@ class DiscordAdapter(BasePlatformAdapter):
             # the bot has previously participated (auto-created or replied in).
             in_bot_thread = is_thread and thread_id in self._threads
 
+            is_self_mentioned = (
+                self._message_mentions_user(message, self._client.user)
+                or self._message_mentions_bot_role(message)
+            )
+
             if require_mention and not is_free_channel and not in_bot_thread:
-                if self._client.user not in message.mentions:
+                if not is_self_mentioned:
                     return
 
-            if self._client.user and self._client.user in message.mentions:
+            if is_self_mentioned and self._client.user:
                 message.content = message.content.replace(f"<@{self._client.user.id}>", "").strip()
                 message.content = message.content.replace(f"<@!{self._client.user.id}>", "").strip()
 

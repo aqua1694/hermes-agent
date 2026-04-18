@@ -8645,7 +8645,9 @@ class GatewayRunner:
                             await adapter.send(
                                 source.chat_id,
                                 first_response,
+
                                 metadata=_status_thread_metadata,
+
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)

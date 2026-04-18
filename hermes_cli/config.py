@@ -337,10 +337,20 @@ DEFAULT_CONFIG = {
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
+
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+
+        # Optional post-answer refinement loop for complex requests.
+        # Disabled by default to avoid surprise latency/cost.
+        "deep_optimization": {
+            "enabled": False,
+            "passes": 1,
+            "min_user_chars": 80,
+        },
+
     },
     
     "terminal": {
@@ -700,9 +710,8 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 18,
 }
-
 # =============================================================================
 # Config Migration System
 # =============================================================================

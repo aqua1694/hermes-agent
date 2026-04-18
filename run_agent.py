@@ -1247,6 +1247,30 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+        # Deep optimization: optional post-answer refinement loop for complex
+        # user requests. Disabled by default to avoid latency/cost surprises.
+        _deep_opt_cfg = _agent_section.get("deep_optimization", {})
+        if not isinstance(_deep_opt_cfg, dict):
+            _deep_opt_cfg = {}
+        self._deep_optimization_enabled = bool(_deep_opt_cfg.get("enabled", False))
+        try:
+            _passes = int(_deep_opt_cfg.get("passes", 1))
+        except Exception:
+            _passes = 1
+        self._deep_optimization_passes = max(1, min(3, _passes))
+        try:
+            _min_chars = int(_deep_opt_cfg.get("min_user_chars", 80))
+        except Exception:
+            _min_chars = 80
+        self._deep_optimization_min_user_chars = max(0, _min_chars)
+        self._last_deep_optimization_meta: Dict[str, Any] = {
+            "enabled": self._deep_optimization_enabled,
+            "triggered": False,
+            "attempted_passes": 0,
+            "applied_passes": 0,
+            "reason": "init",
+        }
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -7742,6 +7766,163 @@ class AIAgent:
 
         return final_response
 
+    def _run_text_refinement_request(self, api_messages: List[Dict[str, Any]]) -> str:
+        """Run a no-tools text refinement request on the current provider path."""
+        _is_nous = "nousresearch" in self._base_url_lower
+        refinement_extra_body = {}
+        if self._supports_reasoning_extra_body():
+            if self.reasoning_config is not None:
+                refinement_extra_body["reasoning"] = self.reasoning_config
+            else:
+                refinement_extra_body["reasoning"] = {
+                    "enabled": True,
+                    "effort": "medium",
+                }
+        if _is_nous:
+            refinement_extra_body["tags"] = ["product=hermes-agent"]
+
+        if self.api_mode == "codex_responses":
+            codex_kwargs = self._build_api_kwargs(api_messages)
+            codex_kwargs.pop("tools", None)
+            refinement_response = self._run_codex_stream(codex_kwargs)
+            refinement_msg, _ = self._normalize_codex_response(refinement_response)
+            return (refinement_msg.content or "").strip() if refinement_msg else ""
+
+        if self.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import build_anthropic_kwargs as _bak, normalize_anthropic_response as _nar
+
+            _ant_kw = _bak(
+                model=self.model,
+                messages=api_messages,
+                tools=None,
+                max_tokens=self.max_tokens,
+                reasoning_config=self.reasoning_config,
+                is_oauth=self._is_anthropic_oauth,
+                preserve_dots=self._anthropic_preserve_dots(),
+            )
+            refinement_response = self._anthropic_messages_create(_ant_kw)
+            _msg, _ = _nar(refinement_response, strip_tool_prefix=self._is_anthropic_oauth)
+            return (_msg.content or "").strip() if _msg else ""
+
+        refinement_kwargs = {
+            "model": self.model,
+            "messages": api_messages,
+        }
+        if self.max_tokens is not None:
+            refinement_kwargs.update(self._max_tokens_param(self.max_tokens))
+        if refinement_extra_body:
+            refinement_kwargs["extra_body"] = refinement_extra_body
+
+        refinement_response = self._ensure_primary_openai_client(
+            reason="deep_optimization_refinement"
+        ).chat.completions.create(**refinement_kwargs)
+        if refinement_response.choices and refinement_response.choices[0].message.content:
+            return (refinement_response.choices[0].message.content or "").strip()
+        return ""
+
+    def _deep_optimization_should_trigger(self, original_user_message: str) -> bool:
+        text = (original_user_message or "").strip()
+        if not text:
+            return False
+        if len(text) >= self._deep_optimization_min_user_chars:
+            return True
+
+        # Keyword fallback: even short prompts like “不停优化方案并执行” should trigger.
+        keyword_pattern = re.compile(
+            r"优化|迭代|打磨|缺点|改进|方案|执行|落地|完善|review|refine|iterate|improve",
+            re.IGNORECASE,
+        )
+        return bool(keyword_pattern.search(text))
+
+    def _deep_optimization_quality_score(self, text: str) -> int:
+        body = (text or "").strip()
+        if not body:
+            return 0
+
+        score = 0
+        if len(body) >= 120:
+            score += 1
+        if re.search(r"(^|\n)\s*(?:\d+[.)]|[-*•])\s+", body):
+            score += 1
+        if re.search(r"风险|注意|限制|坑|risk|pitfall", body, re.IGNORECASE):
+            score += 1
+        if re.search(r"验收|验证|检查|acceptance|criteria|done", body, re.IGNORECASE):
+            score += 1
+        if re.search(r"步骤|执行|实现|命令|落地|step|run|implement", body, re.IGNORECASE):
+            score += 1
+        if re.search(r"作为AI|无法|不能|I\s+can't|I\s+cannot", body, re.IGNORECASE):
+            score -= 1
+        return max(0, score)
+
+    def _maybe_refine_final_response(self, final_response: str, original_user_message: str) -> str:
+        """Optionally run one or more critique/rewrite passes on final output."""
+        self._last_deep_optimization_meta = {
+            "enabled": self._deep_optimization_enabled,
+            "triggered": False,
+            "attempted_passes": 0,
+            "applied_passes": 0,
+            "reason": "disabled",
+        }
+        if not self._deep_optimization_enabled:
+            return final_response
+        if not final_response:
+            self._last_deep_optimization_meta["reason"] = "empty_final_response"
+            return final_response
+        if not self._deep_optimization_should_trigger(original_user_message):
+            self._last_deep_optimization_meta["reason"] = "trigger_not_matched"
+            return final_response
+
+        self._last_deep_optimization_meta["triggered"] = True
+        self._last_deep_optimization_meta["reason"] = "triggered"
+
+        refined = final_response
+        rejected_candidates = 0
+        for _ in range(self._deep_optimization_passes):
+            self._last_deep_optimization_meta["attempted_passes"] += 1
+            refinement_prompt = (
+                "你是高级审稿与产品化专家。请对下面的草稿做“缺陷扫描 + 重写优化”。\n"
+                "目标：让输出更完整、可执行、可验收。\n"
+                "硬性要求：\n"
+                "1) 保留用户原始意图，不要偏题；\n"
+                "2) 补齐关键缺失项（目标/步骤/风险/验收标准）；\n"
+                "3) 去除空话和重复表达；\n"
+                "4) 仅输出改写后的最终答案，不要解释你做了什么。\n\n"
+                f"用户原始请求：\n{(original_user_message or '').strip()}\n\n"
+                f"当前草稿：\n{refined.strip()}"
+            )
+            api_messages = [{"role": "user", "content": refinement_prompt}]
+            try:
+                candidate = self._run_text_refinement_request(api_messages)
+            except Exception as exc:
+                logger.debug("deep optimization refinement failed: %s", exc)
+                self._last_deep_optimization_meta["reason"] = "refinement_error"
+                break
+
+            if not candidate:
+                self._last_deep_optimization_meta["reason"] = "empty_candidate"
+                break
+            cleaned = self._strip_think_blocks(candidate).strip()
+            if not cleaned:
+                self._last_deep_optimization_meta["reason"] = "cleaned_candidate_empty"
+                break
+
+            prev_score = self._deep_optimization_quality_score(refined)
+            cand_score = self._deep_optimization_quality_score(cleaned)
+            # Guardrail: reject clearly worse rewrites that reduce actionable quality.
+            # Allow small style fluctuations, but block large quality regressions.
+            if cand_score + 1 < prev_score and len(cleaned) < int(len(refined) * 0.8):
+                rejected_candidates += 1
+                self._last_deep_optimization_meta["reason"] = "candidate_rejected_quality_regression"
+                continue
+
+            refined = cleaned
+            self._last_deep_optimization_meta["applied_passes"] += 1
+
+        self._last_deep_optimization_meta["rejected_candidates"] = rejected_candidates
+        if self._last_deep_optimization_meta["applied_passes"] > 0:
+            self._last_deep_optimization_meta["reason"] = "refined"
+        return refined
+
     def run_conversation(
         self,
         user_message: str,
@@ -10519,6 +10700,14 @@ class AIAgent:
         else:
             logger.info(_diag_msg, *_diag_args)
 
+        # Optional deep optimization pass: refine the final response for
+        # complex user prompts before hooks/result packaging.
+        if final_response and not interrupted:
+            final_response = self._maybe_refine_final_response(
+                final_response=final_response,
+                original_user_message=original_user_message,
+            )
+
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.
         # Plugins can use this to persist conversation data (e.g. sync
@@ -10570,6 +10759,7 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "deep_optimization": dict(self._last_deep_optimization_meta or {}),
         }
         self._response_was_previewed = False
         

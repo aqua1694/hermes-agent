@@ -241,6 +241,58 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
 
 
 @pytest.mark.asyncio
+async def test_discord_accepts_bot_mentions_from_raw_token_when_mentions_list_empty(adapter, monkeypatch):
+    """Fallback to raw mention token should pass mention gate in guild channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=654),
+        content=f"<@!{bot_user.id}> ping from private thread-like context",
+        mentions=[],
+    )
+    message.raw_mentions = [bot_user.id]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "ping from private thread-like context"
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_role_mentions_when_role_includes_bot(adapter, monkeypatch):
+    """Role pings (<@&...>) should satisfy mention gating when the bot has that role."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    role_id = 1492584632389079247
+    thread = FakeThread(channel_id=777, name="new-thread")
+    thread.guild = SimpleNamespace(
+        name="Hermes Server",
+        me=SimpleNamespace(roles=[SimpleNamespace(id=role_id)]),
+    )
+
+    message = make_message(
+        channel=thread,
+        content=f"<@&{role_id}> 你在吗",
+        mentions=[],
+    )
+    message.guild = thread.guild
+    message.role_mentions = [SimpleNamespace(id=role_id)]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == f"<@&{role_id}> 你在吗"
+    assert event.source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
 async def test_discord_dms_ignore_mention_requirement(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
