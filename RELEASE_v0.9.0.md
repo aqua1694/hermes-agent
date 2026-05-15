@@ -326,4 +326,8 @@
 
 ---
 
+## Local Delta
+
+- Messaging model management: added shared `/model set ...` and `/project ...` backend syntax, plus structured Discord slash parameters for model/project actions.
+
 **Full Changelog**: [v2026.4.8...v2026.4.13](https://github.com/NousResearch/hermes-agent/compare/v2026.4.8...v2026.4.13)

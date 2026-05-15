@@ -262,6 +262,17 @@ The bot should come online in Discord within a few seconds. Send it a message â€
 You can run `hermes gateway` in the background or as a systemd service for persistent operation. See the deployment docs for details.
 :::
 
+## Model Commands
+
+Discord exposes structured native slash commands for model and project routing:
+
+- `/model action:current` shows the effective main/auxiliary model for the current chat
+- `/model action:set name:<model> scope:global|project target:both|main|auxiliary` updates config
+- `/project action:use project:<name>` binds the current Discord chat or thread to a project
+- `/project action:clear` removes the current binding
+
+These slash commands compile to the same backend command syntax used by other messaging platforms, so Discord, Feishu, Slack, and text-based adapters stay behaviorally aligned.
+
 ## Configuration Reference
 
 Discord behavior is controlled through two files: **`~/.hermes/.env`** for credentials and env-level toggles, and **`~/.hermes/config.yaml`** for structured settings. Environment variables always take precedence over config.yaml values when both are set.
@@ -697,5 +708,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

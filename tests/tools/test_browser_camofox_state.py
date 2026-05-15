@@ -58,3 +58,5 @@ class TestCamofoxConfigDefaults:
 
         browser_cfg = DEFAULT_CONFIG["browser"]
         assert browser_cfg["camofox"]["managed_persistence"] is False
+
+

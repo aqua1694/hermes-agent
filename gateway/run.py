@@ -1780,6 +1780,394 @@ class GatewayRunner:
             session_id=session_entry.session_id,
         )
 
+    def _load_user_config(self) -> dict:
+        return _load_gateway_config()
+
+    def _save_user_config(self, config: dict) -> None:
+        from hermes_cli.config import save_config
+
+        save_config(config if isinstance(config, dict) else {})
+
+    def _normalize_runtime_bundle(
+        self,
+        bundle: Optional[dict] = None,
+        *,
+        model: str = "",
+        provider: str = "",
+        base_url: str = "",
+        api_mode: str = "",
+        api_key: Optional[str] = None,
+    ) -> dict:
+        raw = bundle if isinstance(bundle, dict) else {}
+        normalized = {
+            "model": str(raw.get("model", model) or model or "").strip(),
+            "provider": str(raw.get("provider", provider) or provider or "").strip(),
+            "base_url": str(raw.get("base_url", base_url) or base_url or "").strip(),
+            "api_mode": str(raw.get("api_mode", api_mode) or api_mode or "").strip(),
+        }
+        final_api_key = raw.get("api_key", api_key)
+        if isinstance(final_api_key, str) and final_api_key.strip():
+            normalized["api_key"] = final_api_key.strip()
+        return {key: value for key, value in normalized.items() if value}
+
+    def _project_model_configs(self, config: Optional[dict] = None) -> dict:
+        cfg = config if isinstance(config, dict) else self._load_user_config()
+        gateway_cfg = cfg.setdefault("gateway", {})
+        if not isinstance(gateway_cfg, dict):
+            gateway_cfg = {}
+            cfg["gateway"] = gateway_cfg
+        project_models = gateway_cfg.setdefault("project_models", {})
+        if not isinstance(project_models, dict):
+            project_models = {}
+            gateway_cfg["project_models"] = project_models
+        return project_models
+
+    def _project_config_map(self, config: Optional[dict] = None) -> dict[str, dict]:
+        cfg = config if isinstance(config, dict) else self._load_user_config()
+        projects = cfg.get("projects", [])
+        result: dict[str, dict] = {}
+        for project in projects if isinstance(projects, list) else []:
+            if not isinstance(project, dict):
+                continue
+            name = str(project.get("name", "") or "").strip()
+            if name:
+                result[name] = project
+        return result
+
+    def _ensure_named_project_config(self, project_name: str, config: Optional[dict] = None) -> dict:
+        cfg = config if isinstance(config, dict) else self._load_user_config()
+        projects = cfg.setdefault("projects", [])
+        if not isinstance(projects, list):
+            projects = []
+            cfg["projects"] = projects
+        name = str(project_name or "").strip()
+        for project in projects:
+            if isinstance(project, dict) and str(project.get("name", "") or "").strip() == name:
+                if not project.get("path"):
+                    project["path"] = str(_hermes_home / "projects" / name)
+                return project
+        new_project = {"name": name, "path": str(_hermes_home / "projects" / name)}
+        projects.append(new_project)
+        return new_project
+
+    def _get_project_config(self, project_name: str, config: Optional[dict] = None) -> dict:
+        cfg = config if isinstance(config, dict) else self._load_user_config()
+        merged: dict[str, Any] = {}
+
+        legacy_cfg = self._project_model_configs(cfg).get(project_name)
+        if isinstance(legacy_cfg, dict):
+            merged.update(legacy_cfg)
+
+        project_cfg = self._project_config_map(cfg).get(str(project_name or "").strip())
+        if isinstance(project_cfg, dict):
+            merged.update(project_cfg)
+        return merged
+
+    def _get_bound_project(self, session_key: str) -> str:
+        if getattr(self, "session_store", None) is None:
+            return ""
+        try:
+            return str(self.session_store.get_project_name(session_key) or "").strip()
+        except Exception:
+            return ""
+
+    def _set_bound_project(self, session_key: str, project_name: Optional[str]) -> bool:
+        if getattr(self, "session_store", None) is None:
+            return False
+        try:
+            return bool(self.session_store.set_project_name(session_key, project_name))
+        except Exception:
+            return False
+
+    def _get_bound_project_path(self, session_key: str, config: Optional[dict] = None) -> str:
+        project_name = self._get_bound_project(session_key)
+        if not project_name:
+            return ""
+        project_cfg = self._get_project_config(project_name, config)
+        return str(project_cfg.get("path", "") or "").strip()
+
+    def _list_local_projects(self, config: Optional[dict] = None) -> list[str]:
+        names: set[str] = set()
+        cfg = config if isinstance(config, dict) else self._load_user_config()
+        names.update(self._project_config_map(cfg).keys())
+        projects_dir = _hermes_home / "projects"
+        try:
+            if projects_dir.exists():
+                for child in projects_dir.iterdir():
+                    if child.is_dir() and not child.name.startswith("."):
+                        names.add(child.name)
+        except Exception:
+            pass
+        return sorted(names)
+
+    def _set_session_project_runtime_override(
+        self,
+        session_key: str,
+        *,
+        session_id: Optional[str] = None,
+        user_config: Optional[dict] = None,
+    ) -> str:
+        project_path = self._get_bound_project_path(session_key, user_config)
+        if not project_path:
+            return ""
+        from tools.terminal_tool import register_task_env_overrides
+
+        runtime_keys = [session_key]
+        if session_id and session_id not in runtime_keys:
+            runtime_keys.append(session_id)
+        for runtime_key in runtime_keys:
+            register_task_env_overrides(runtime_key, {"cwd": project_path})
+        return project_path
+
+    def _reset_project_runtime(self, session_key: str, *, session_id: Optional[str] = None) -> None:
+        try:
+            from tools.terminal_tool import clear_task_env_overrides, cleanup_vm
+
+            runtime_keys = [session_key]
+            if session_id and session_id not in runtime_keys:
+                runtime_keys.append(session_id)
+            for runtime_key in runtime_keys:
+                clear_task_env_overrides(runtime_key)
+                cleanup_vm(runtime_key)
+        except Exception:
+            pass
+
+    def _extract_main_bundle(self, container: Optional[dict]) -> dict:
+        raw = container if isinstance(container, dict) else {}
+        if isinstance(raw.get("main"), dict):
+            return self._normalize_runtime_bundle(raw.get("main"))
+        model_cfg = raw.get("model", {}) if isinstance(raw.get("model", {}), dict) else {}
+        return self._normalize_runtime_bundle(
+            {
+                "model": model_cfg.get("default", ""),
+                "provider": model_cfg.get("provider", ""),
+                "base_url": model_cfg.get("base_url", ""),
+                "api_mode": model_cfg.get("api_mode", ""),
+            }
+        )
+
+    def _extract_auxiliary_bundle(self, container: Optional[dict]) -> dict:
+        raw = container if isinstance(container, dict) else {}
+        aux_cfg = raw.get("auxiliary", {})
+        if isinstance(aux_cfg, dict) and any(
+            str(aux_cfg.get(key, "") or "").strip()
+            for key in ("model", "provider", "base_url", "api_mode", "api_key")
+        ):
+            return self._normalize_runtime_bundle(aux_cfg)
+        if isinstance(aux_cfg, dict):
+            for task_name in ("vision", "web_extract", "compression", "session_search", "skills_hub", "approval", "mcp"):
+                task_cfg = aux_cfg.get(task_name, {})
+                if isinstance(task_cfg, dict) and any(
+                    str(task_cfg.get(key, "") or "").strip()
+                    for key in ("model", "provider", "base_url", "api_mode", "api_key")
+                ):
+                    return self._normalize_runtime_bundle(task_cfg)
+        return {}
+
+    def _apply_main_bundle_to_container(self, container: dict, bundle: dict) -> None:
+        model_cfg = container.setdefault("model", {})
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+            container["model"] = model_cfg
+        normalized = self._normalize_runtime_bundle(bundle)
+        model_cfg["default"] = normalized.get("model", "")
+        model_cfg["provider"] = normalized.get("provider", "")
+        model_cfg["base_url"] = normalized.get("base_url", "")
+        model_cfg["api_mode"] = normalized.get("api_mode", "")
+
+    def _apply_auxiliary_bundle_to_container(self, container: dict, bundle: dict) -> None:
+        aux_cfg = container.setdefault("auxiliary", {})
+        if not isinstance(aux_cfg, dict):
+            aux_cfg = {}
+            container["auxiliary"] = aux_cfg
+        normalized = self._normalize_runtime_bundle(bundle)
+        for task_name in ("vision", "web_extract", "compression", "session_search", "skills_hub", "approval", "mcp"):
+            task_cfg = aux_cfg.get(task_name, {})
+            if not isinstance(task_cfg, dict):
+                task_cfg = {}
+            task_cfg["model"] = normalized.get("model", "")
+            task_cfg["provider"] = normalized.get("provider", "")
+            task_cfg["base_url"] = normalized.get("base_url", "")
+            task_cfg["api_mode"] = normalized.get("api_mode", "")
+            aux_cfg[task_name] = task_cfg
+
+    def _load_dashboard_yaml(self, file_name: str) -> dict:
+        import yaml
+
+        path = _hermes_home / "base" / file_name
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _load_model_assignments(self) -> dict:
+        return self._load_dashboard_yaml("model_assignments.yaml")
+
+    def _load_conversation_bindings(self) -> dict:
+        return self._load_dashboard_yaml("conversation_bindings.yaml")
+
+    def _find_bound_project_for_source(self, source: Optional[SessionSource]) -> str:
+        if source is None:
+            return ""
+        bindings = self._load_conversation_bindings().get("bindings", [])
+        if not isinstance(bindings, list):
+            return ""
+        platform = source.platform.value if getattr(source, "platform", None) else ""
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            if str(binding.get("platform", "") or "").strip() != platform:
+                continue
+            if str(binding.get("chat_id", "") or "").strip() != chat_id:
+                continue
+            if str(binding.get("thread_id", "") or "").strip() != thread_id:
+                continue
+            return str(binding.get("project", "") or "").strip()
+        return ""
+
+    def _ensure_session_project_binding(self, session_key: str, source: Optional[SessionSource]) -> str:
+        project_name = self._get_bound_project(session_key)
+        if project_name:
+            return project_name
+        project_name = self._find_bound_project_for_source(source)
+        if project_name:
+            self._set_bound_project(session_key, project_name)
+        return project_name
+
+    def _conversation_assignment(self, session_key: str) -> dict:
+        assignments = self._load_model_assignments().get("conversations", [])
+        if not isinstance(assignments, list):
+            return {}
+        key = str(session_key or "").strip()
+        for entry in assignments:
+            if isinstance(entry, dict) and str(entry.get("session_key", "") or "").strip() == key:
+                return entry
+        return {}
+
+    def _conversation_main_override(self, session_key: str) -> dict:
+        return self._extract_main_bundle({"main": self._conversation_assignment(session_key).get("main", {})})
+
+    def _conversation_aux_override(self, session_key: str) -> dict:
+        return self._extract_auxiliary_bundle({"auxiliary": self._conversation_assignment(session_key).get("auxiliary", {})})
+
+    def _project_main_override(self, project_name: str, config: Optional[dict] = None) -> dict:
+        return self._extract_main_bundle(self._get_project_config(project_name, config))
+
+    def _project_aux_override(self, project_name: str, config: Optional[dict] = None) -> dict:
+        return self._extract_auxiliary_bundle(self._get_project_config(project_name, config))
+
+    def _global_aux_override(self, config: Optional[dict] = None) -> dict:
+        cfg = config if isinstance(config, dict) else self._load_user_config()
+        return self._extract_auxiliary_bundle(cfg)
+
+    def _apply_bundle_to_runtime(self, bundle: dict, model: str, runtime_kwargs: dict) -> tuple[str, dict]:
+        if not bundle:
+            return model, runtime_kwargs
+        resolved_model = bundle.get("model", model) or model
+        resolved_runtime = dict(runtime_kwargs or {})
+        for field in ("provider", "base_url", "api_mode", "api_key"):
+            value = bundle.get(field)
+            if value is not None and value != "":
+                resolved_runtime[field] = value
+        return resolved_model, resolved_runtime
+
+    def _apply_persisted_project_override(
+        self,
+        session_key: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        user_config: Optional[dict] = None,
+    ) -> tuple[str, dict]:
+        project_name = self._get_bound_project(session_key)
+        if not project_name:
+            return model, runtime_kwargs
+        return self._apply_bundle_to_runtime(
+            self._project_main_override(project_name, user_config),
+            model,
+            runtime_kwargs,
+        )
+
+    def _effective_auxiliary_override(
+        self,
+        session_key: str,
+        user_config: Optional[dict] = None,
+    ) -> dict:
+        conversation_override = self._conversation_aux_override(session_key)
+        if conversation_override:
+            return conversation_override
+        project_name = self._get_bound_project(session_key)
+        if project_name:
+            project_override = self._project_aux_override(project_name, user_config)
+            if project_override:
+                return project_override
+        return self._global_aux_override(user_config)
+
+    def _render_model_current(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        user_config: Optional[dict] = None,
+    ) -> str:
+        config = user_config if isinstance(user_config, dict) else self._load_user_config()
+        global_main = self._extract_main_bundle(config)
+        global_model = global_main.get("model", "")
+        global_provider = global_main.get("provider", "openrouter") or "openrouter"
+        global_aux = self._global_aux_override(config)
+        self._ensure_session_project_binding(session_key, source)
+
+        try:
+            effective_model, effective_runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=config,
+            )
+        except Exception:
+            effective_model = global_model
+            effective_runtime = {
+                "provider": global_provider,
+                "base_url": global_main.get("base_url", ""),
+                "api_mode": global_main.get("api_mode", ""),
+            }
+        project_name = self._get_bound_project(session_key)
+        conversation_main = self._conversation_main_override(session_key)
+        conversation_aux = self._conversation_aux_override(session_key)
+        project_aux = self._effective_auxiliary_override(session_key, config)
+        session_override = self._session_model_overrides.get(session_key, {})
+        project_path = self._get_bound_project_path(session_key, config)
+
+        lines = ["**Current Model Config**"]
+        lines.append(f"Main model: `{effective_model or global_model or 'unknown'}`")
+        lines.append(f"Provider: {effective_runtime.get('provider') or global_provider or 'unknown'}")
+        lines.append(f"Bound project: `{project_name}`" if project_name else "Bound project: _(none)_")
+        if project_path:
+            lines.append(f"Project path: `{project_path}`")
+        if conversation_aux.get("model"):
+            lines.append(f"Auxiliary model: `{conversation_aux['model']}` (conversation)")
+        elif project_aux.get("model"):
+            lines.append(f"Auxiliary model: `{project_aux['model']}` ({'project' if project_name else 'global'})")
+        elif global_aux.get("model"):
+            lines.append(f"Auxiliary model: `{global_aux['model']}` (global)")
+        else:
+            lines.append("Auxiliary model: `(auto)`")
+
+        if session_override:
+            lines.append("Main scope: `session override`")
+        elif conversation_main:
+            lines.append("Main scope: `conversation`")
+        elif project_name and self._project_main_override(project_name, config):
+            lines.append("Main scope: `project`")
+        else:
+            lines.append("Main scope: `global`")
+        return "\n".join(lines)
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -1839,10 +2227,27 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        if resolved_session_key:
+            self._ensure_session_project_binding(resolved_session_key, source)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+        elif resolved_session_key:
+            conversation_override = self._conversation_main_override(resolved_session_key)
+            if conversation_override:
+                model, runtime_kwargs = self._apply_bundle_to_runtime(
+                    conversation_override,
+                    model,
+                    runtime_kwargs,
+                )
+            else:
+                model, runtime_kwargs = self._apply_persisted_project_override(
+                    resolved_session_key,
+                    model,
+                    runtime_kwargs,
+                    user_config=user_config,
+                )
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -6037,9 +6442,10 @@ class GatewayRunner:
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
-            # /model must not be used while the agent is running.
-            if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+            # /model and /project mutate runtime/session config and should not
+            # race with an in-flight agent execution.
+            if _cmd_def_inner and _cmd_def_inner.name in ("model", "project"):
+                return "Agent is running - wait or /stop first, then change model/project settings."
 
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
@@ -6374,6 +6780,9 @@ class GatewayRunner:
 
         if canonical == "model":
             return await self._handle_model_command(event)
+
+        if canonical == "project":
+            return await self._handle_project_command(event)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -6983,6 +7392,7 @@ class GatewayRunner:
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        self._set_session_project_runtime_override(session_key, session_id=session_entry.session_id)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -8813,6 +9223,8 @@ class GatewayRunner:
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
+        if not raw_args or raw_args.lower() == "current" or raw_args.lower().startswith("set "):
+            return await self._handle_model_config_command(event)
 
         # Parse --provider and --global flags
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
@@ -9153,6 +9565,222 @@ class GatewayRunner:
             lines.append(t("gateway.model.session_only_hint"))
 
         return "\n".join(lines)
+
+    async def _handle_model_config_command(self, event: MessageEvent) -> str:
+        """Handle `/model current` and `/model set ...` cross-platform syntax."""
+        from hermes_cli.model_switch import switch_model as _switch_model, parse_model_flags
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        config = self._load_user_config()
+        raw_args = event.get_command_args().strip()
+
+        if not raw_args or raw_args.lower() == "current":
+            return self._render_model_current(
+                session_key=session_key,
+                source=source,
+                user_config=config,
+            )
+
+        args_for_set = raw_args[4:].strip() if raw_args.lower().startswith("set ") else raw_args
+        try:
+            tokens = shlex.split(args_for_set)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if not tokens:
+            return "Usage: /model set <model> [--main|--auxiliary] [--global|--project <name>] [--bind]"
+
+        bind_current: Optional[bool] = None
+        target_main = False
+        target_aux = False
+        project_name = ""
+        filtered_tokens: list[str] = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token == "--bind":
+                bind_current = True
+                i += 1
+                continue
+            if token == "--no-bind":
+                bind_current = False
+                i += 1
+                continue
+            if token == "--main":
+                target_main = True
+                i += 1
+                continue
+            if token == "--auxiliary":
+                target_aux = True
+                i += 1
+                continue
+            if token == "--project" and i + 1 < len(tokens):
+                project_name = tokens[i + 1].strip()
+                filtered_tokens.extend([token, tokens[i + 1]])
+                i += 2
+                continue
+            filtered_tokens.append(token)
+            i += 1
+
+        if not target_main and not target_aux:
+            target_main = True
+            target_aux = True
+        if project_name and bind_current is None:
+            bind_current = True
+
+        model_input, explicit_provider, _ = parse_model_flags(" ".join(filtered_tokens))
+        if not model_input:
+            return "Usage: /model set <model> [--main|--auxiliary] [--global|--project <name>] [--bind]"
+
+        current_model, current_runtime = self._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=config,
+        )
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            custom_providers = config.get("custom_providers")
+
+        result = _switch_model(
+            raw_input=model_input,
+            current_provider=current_runtime.get("provider", "openrouter"),
+            current_model=current_model,
+            current_base_url=current_runtime.get("base_url", ""),
+            current_api_key=current_runtime.get("api_key", ""),
+            is_global=not project_name,
+            explicit_provider=explicit_provider,
+            user_providers=config.get("providers"),
+            custom_providers=custom_providers,
+        )
+        if not result.success:
+            return f"Error: {result.error_message}"
+
+        bundle = self._normalize_runtime_bundle(
+            model=result.new_model,
+            provider=result.target_provider,
+            base_url=result.base_url,
+            api_mode=result.api_mode,
+            api_key=result.api_key,
+        )
+
+        if project_name:
+            project_cfg = self._ensure_named_project_config(project_name, config)
+            if target_main:
+                self._apply_main_bundle_to_container(project_cfg, bundle)
+            if target_aux:
+                self._apply_auxiliary_bundle_to_container(project_cfg, bundle)
+            self._save_user_config(config)
+            if bind_current:
+                self._set_bound_project(session_key, project_name)
+        else:
+            if target_main:
+                model_cfg = config.setdefault("model", {})
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                    config["model"] = model_cfg
+                model_cfg["default"] = bundle.get("model", "")
+                model_cfg["provider"] = bundle.get("provider", "")
+                model_cfg["base_url"] = bundle.get("base_url", "")
+                if bundle.get("api_mode"):
+                    model_cfg["api_mode"] = bundle["api_mode"]
+            if target_aux:
+                aux_cfg = config.setdefault("auxiliary", {})
+                if not isinstance(aux_cfg, dict):
+                    aux_cfg = {}
+                    config["auxiliary"] = aux_cfg
+                for task_name in ("vision", "web_extract", "compression", "session_search", "skills_hub", "approval", "mcp"):
+                    task_cfg = aux_cfg.setdefault(task_name, {})
+                    if not isinstance(task_cfg, dict):
+                        task_cfg = {}
+                        aux_cfg[task_name] = task_cfg
+                    task_cfg["provider"] = bundle.get("provider", task_cfg.get("provider", "auto"))
+                    task_cfg["model"] = bundle.get("model", "")
+                    task_cfg["base_url"] = bundle.get("base_url", "")
+                    if bundle.get("api_mode"):
+                        task_cfg["api_mode"] = bundle["api_mode"]
+            self._save_user_config(config)
+
+        if target_main and (not project_name or bind_current):
+            self._session_model_overrides[session_key] = bundle
+            self._evict_cached_agent(session_key)
+
+        target_label = "both" if target_main and target_aux else ("main" if target_main else "auxiliary")
+        lines = ["Model configuration updated"]
+        lines.append(f"Scope: {'project' if project_name else 'global'}")
+        lines.append(f"Target: {target_label}")
+        lines.append(f"Model: `{bundle.get('model', result.new_model)}`")
+        lines.append(f"Provider: {result.provider_label or result.target_provider}")
+        if project_name:
+            lines.append(f"Project: `{project_name}`")
+            if bind_current:
+                lines.append(f"Current chat bound to project `{project_name}`")
+            else:
+                lines.append("Current chat binding unchanged")
+        return "\n".join(lines)
+
+    async def _handle_project_command(self, event: MessageEvent) -> str:
+        """Handle `/project use|clear|current` for gateway sessions."""
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        session_entry = self.session_store.get_or_create_session(source)
+        session_id = getattr(session_entry, "session_id", "") or ""
+        raw_args = event.get_command_args().strip()
+        if not raw_args or raw_args.lower() == "current":
+            project_name = self._get_bound_project(session_key)
+            if not project_name:
+                return "Current project: _(none)_"
+            return f"Current project: `{project_name}`\n\n{self._render_model_current(session_key=session_key, source=source)}"
+
+        try:
+            tokens = shlex.split(raw_args)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if not tokens:
+            return "Usage: /project [use <name> [path]|clear|current]"
+
+        action = tokens[0].lower()
+        if action == "list":
+            config = self._load_user_config()
+            projects = self._list_local_projects(config)
+            current = self._get_bound_project(session_key)
+            lines = ["Available projects:"]
+            if not projects:
+                lines.append("_(none)_")
+            else:
+                for name in projects:
+                    suffix = " (current)" if name == current else ""
+                    lines.append(f"- `{name}`{suffix}")
+            lines.append(f"Current project: `{current}`" if current else "Current project: _(none)_")
+            return "\n".join(lines)
+        if action == "clear":
+            self._set_bound_project(session_key, None)
+            self._evict_cached_agent(session_key)
+            self._reset_project_runtime(session_key, session_id=session_id)
+            return "Cleared project binding for this chat."
+        if action == "use":
+            if len(tokens) < 2:
+                return "Usage: /project use <name> [path]"
+            project_name = tokens[1].strip()
+            config = self._load_user_config()
+            if len(tokens) < 3 and project_name not in self._list_local_projects(config):
+                return f"Project not found: `{project_name}`. Use `/project list` to see available projects."
+            project_cfg = self._ensure_named_project_config(project_name, config)
+            if len(tokens) >= 3:
+                project_path = str(Path(tokens[2]).expanduser())
+                if not os.path.isabs(project_path):
+                    project_path = os.path.abspath(project_path)
+                if not os.path.isdir(project_path):
+                    return f"Project path does not exist or is not a directory: `{project_path}`"
+                project_cfg["path"] = project_path
+                self._save_user_config(config)
+            self._set_bound_project(session_key, project_name)
+            self._evict_cached_agent(session_key)
+            self._reset_project_runtime(session_key, session_id=session_id)
+            self._set_session_project_runtime_override(session_key, session_id=session_id, user_config=config)
+            return f"Bound this chat to project `{project_name}`.\n\n{self._render_model_current(session_key=session_key, source=source)}"
+        return "Usage: /project [use <name> [path]|clear|current]"
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
@@ -15201,7 +15829,28 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                from agent.auxiliary_client import auxiliary_runtime_override
+
+                _aux_override = self._effective_auxiliary_override(
+                    session_key or "",
+                    user_config=user_config,
+                )
+                _main_override = self._normalize_runtime_bundle(
+                    model=agent.model,
+                    provider=agent.provider,
+                    base_url=agent.base_url,
+                    api_mode=getattr(agent, "api_mode", ""),
+                    api_key=getattr(agent, "api_key", None),
+                )
+                with auxiliary_runtime_override(
+                    main_runtime=_main_override,
+                    auxiliary_runtime=_aux_override,
+                ):
+                    result = agent.run_conversation(
+                        _run_message,
+                        conversation_history=agent_history,
+                        task_id=session_id,
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
@@ -15834,7 +16483,9 @@ class GatewayRunner:
                             await adapter.send(
                                 source.chat_id,
                                 first_response,
+
                                 metadata=_status_thread_metadata,
+
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)

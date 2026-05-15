@@ -515,6 +515,31 @@ streaming:
   # cursor: " ▉"              # cursor shown during streaming
 
 # =============================================================================
+# Gateway Project Model Overrides (Messaging)
+# =============================================================================
+# Optional per-project main/auxiliary model presets used by messaging commands:
+#   /model set <model> --project <name>
+#   /project use <name>
+#
+# In messaging platforms, `--project <name>` saves the project config and binds
+# the current chat by default. Add `--no-bind` if you only want to save the
+# project preset without changing the current chat.
+#
+# gateway:
+#   project_models:
+#     sample-project:
+#       main:
+#         provider: openrouter
+#         model: xiaomi/mimo-v2-pro
+#         base_url: https://openrouter.ai/api/v1
+#         api_mode: chat_completions
+#       auxiliary:
+#         provider: openrouter
+#         model: xiaomi/mimo-v2-pro
+#         base_url: https://openrouter.ai/api/v1
+#         api_mode: chat_completions
+
+# =============================================================================
 # Skills Configuration
 # =============================================================================
 # Skills are reusable procedures the agent can load and follow. The agent can

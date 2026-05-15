@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,6 +178,8 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    project_name: str = ""
+    project_path: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -189,6 +193,8 @@ class SessionContext:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "project_name": self.project_name,
+            "project_path": self.project_path,
         }
 
 
@@ -292,6 +298,11 @@ def build_session_context_prompt(
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+
+    if getattr(context, "project_name", ""):
+        lines.append(f"**Bound Project:** `{context.project_name}`")
+        if getattr(context, "project_path", ""):
+            lines.append(f"**Project Path:** `{context.project_path}`")
 
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups
@@ -440,6 +451,7 @@ class SessionEntry:
     display_name: Optional[str] = None
     platform: Optional[Platform] = None
     chat_type: str = "dm"
+    project_name: Optional[str] = None
     
     # Token tracking
     input_tokens: int = 0
@@ -500,6 +512,7 @@ class SessionEntry:
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
+            "project_name": self.project_name,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -553,6 +566,7 @@ class SessionEntry:
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
+            project_name=data.get("project_name"),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             cache_read_tokens=data.get("cache_read_tokens", 0),
@@ -1148,6 +1162,7 @@ class SessionStore:
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                project_name=old_entry.project_name,
                 is_fresh_reset=True,
             )
 
@@ -1209,6 +1224,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                project_name=old_entry.project_name,
             )
 
             self._entries[session_key] = new_entry
@@ -1241,6 +1257,27 @@ class SessionStore:
         entries.sort(key=lambda e: e.updated_at, reverse=True)
 
         return entries
+
+    def set_project_name(self, session_key: str, project_name: Optional[str]) -> bool:
+        """Persist the bound project name for a session key."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            entry.project_name = str(project_name or "").strip() or None
+            entry.updated_at = _now()
+            self._save()
+            return True
+
+    def get_project_name(self, session_key: str) -> Optional[str]:
+        """Return the project bound to a session key, if any."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            return entry.project_name
     
     def get_transcript_path(self, session_id: str) -> Path:
         """Get the path to a session's legacy transcript file."""
@@ -1388,5 +1425,8 @@ def build_session_context(
         context.session_id = session_entry.session_id
         context.created_at = session_entry.created_at
         context.updated_at = session_entry.updated_at
+        context.project_name = str(getattr(session_entry, "project_name", "") or "").strip()
+        if context.project_name:
+            context.project_path = str(get_hermes_home() / "projects" / context.project_name)
     
     return context

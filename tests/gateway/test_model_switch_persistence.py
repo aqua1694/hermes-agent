@@ -11,6 +11,7 @@ Tests exercise the real ``_apply_session_model_override()`` and
 ``_is_intentional_model_switch()`` methods on ``GatewayRunner``.
 """
 
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -58,6 +60,7 @@ def _make_runner():
     runner._session_db = None
     runner._agent_cache = {}
     runner._agent_cache_lock = None
+    runner._evict_cached_agent = lambda _session_key: None
     runner._effective_model = None
     runner._effective_provider = None
     runner.session_store = MagicMock()
@@ -72,6 +75,8 @@ def _make_runner():
     )
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store._entries = {session_key: session_entry}
+    runner.session_store.get_project_name.return_value = None
+    runner.session_store.set_project_name.return_value = True
     return runner
 
 
@@ -243,3 +248,76 @@ class TestIsIntentionalModelSwitch:
         }
 
         assert runner._is_intentional_model_switch(sk, "gpt-5.4") is False
+
+
+def test_project_use_binds_current_session():
+    runner = _make_runner()
+    source = _make_source()
+    runner._list_local_projects = lambda config=None: ["sample-project"]
+    event = MessageEvent(
+        text="/project use sample-project",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    result = asyncio.run(runner._handle_project_command(event))
+
+    runner.session_store.set_project_name.assert_called_once()
+    assert "sample-project" in result
+
+
+def test_model_set_project_binds_by_default():
+    runner = _make_runner()
+    source = _make_source()
+    runner._load_user_config = lambda: {"providers": {}, "custom_providers": []}
+    runner._save_user_config = lambda _config: None
+    runner._resolve_session_agent_runtime = lambda **kwargs: (
+        "anthropic/claude-sonnet-4",
+        {"provider": "openrouter", "base_url": "", "api_key": "key"},
+    )
+
+    event = MessageEvent(
+        text="/model set xiaomi/mimo-v2-pro --project sample-project",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    from unittest.mock import patch
+
+    with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
+        success=True,
+        new_model="xiaomi/mimo-v2-pro",
+        target_provider="openrouter",
+        base_url="",
+        api_mode="chat_completions",
+        api_key="key",
+        provider_label="OpenRouter",
+    )):
+        result = asyncio.run(runner._handle_model_config_command(event))
+
+    runner.session_store.set_project_name.assert_called_once()
+    assert "Current chat bound to project" in result
+
+
+def test_model_current_shows_bound_project():
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    runner.session_store.get_project_name.return_value = "sample-project"
+    runner._session_model_overrides[session_key] = {
+        "model": "xiaomi/mimo-v2-pro",
+        "provider": "openrouter",
+        "api_key": "key",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+    }
+    event = MessageEvent(
+        text="/model current",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    result = asyncio.run(runner._handle_model_command(event))
+
+    assert "sample-project" in result
+    assert "xiaomi/mimo-v2-pro" in result

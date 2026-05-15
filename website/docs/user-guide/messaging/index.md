@@ -129,7 +129,10 @@ hermes gateway status --system         # Linux only: inspect the system service 
 | Command | Description |
 |---------|-------------|
 | `/new` or `/reset` | Start a fresh conversation |
-| `/model [provider:model]` | Show or change the model (supports `provider:model` syntax) |
+| `/model current` | Show the effective main/auxiliary model config for this chat |
+| `/model set <model> [--main\|--auxiliary] [--global\|--project <name>] [--bind\|--no-bind]` | Update global or project model config from any messaging platform |
+| `/model [provider:model]` | Legacy session-only model switch (supports `provider:model` syntax) |
+| `/project [use <name>\|clear\|current]` | Bind this chat to a project or inspect the current binding |
 | `/personality [name]` | Set a personality |
 | `/retry` | Retry the last message |
 | `/undo` | Remove the last exchange |

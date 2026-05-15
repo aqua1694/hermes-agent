@@ -118,8 +118,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model for this session", "Configuration",
-               aliases=("provider",), args_hint="[model] [--provider name] [--global]"),
+    CommandDef("model", "Show current model or manage global/project model config", "Configuration",
+               aliases=("provider",),
+               args_hint="[current|set <model> [--main|--auxiliary] [--global|--project <name>] [--bind]]"),
+    CommandDef("project", "Bind this chat to a project or inspect the current binding", "Configuration",
+               gateway_only=True, args_hint="[use <name> [path]|clear|current]",
+               subcommands=("use", "clear", "current")),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",
                cli_only=True),
 

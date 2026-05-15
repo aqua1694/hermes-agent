@@ -477,9 +477,11 @@ DEFAULT_CONFIG = {
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
+
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
+
         # Lower values mean faster feedback on slow tasks but more chat
         # noise; 180s is a compromise that catches spinning weak-model runs
         # (60+ tool iterations with tiny output) before users assume the
@@ -513,7 +515,15 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # Optional post-answer refinement loop for complex requests.
+        # Disabled by default to avoid surprise latency/cost.
+        "deep_optimization": {
+            "enabled": False,
+            "passes": 1,
+            "min_user_chars": 80,
+        },
         "disabled_toolsets": [],
+
     },
     
     "terminal": {
@@ -1470,10 +1480,15 @@ DEFAULT_CONFIG = {
         "backup_keep": 5,
     },
 
+    "gateway": {
+        # Per-project messaging overrides used by `/model set ... --project`.
+        # Shape: {project_name: {main: {...}, auxiliary: {...}}}
+        "project_models": {},
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 23,
 }
-
 # =============================================================================
 # Config Migration System
 # =============================================================================

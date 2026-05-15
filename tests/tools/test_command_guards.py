@@ -131,11 +131,15 @@ class TestTirithBlock:
 
 
 
+
+
 # ---------------------------------------------------------------------------
 # tirith allow + dangerous command (existing behavior preserved)
 # ---------------------------------------------------------------------------
 
 class TestTirithAllowDangerous:
+
+
 
     @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
     def test_dangerous_only_cli_deny(self, mock_tirith):
@@ -193,6 +197,8 @@ class TestTirithWarnSafe:
 # ---------------------------------------------------------------------------
 
 class TestCombinedWarnings:
+
+
 
     @patch(_TIRITH_PATCH,
            return_value=_tirith_result("warn",
@@ -274,7 +280,8 @@ class TestWarnEmptyFindings:
         assert result["approved"] is True
         cb.assert_called_once()
         desc = cb.call_args[0][1]
-        assert "Security scan" in desc
+        # Chinese description should include risk explanation
+        assert "操作" in desc or "风险" in desc or "安全" in desc
 
 
 

@@ -40,6 +40,8 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -127,6 +129,7 @@ def _extract_url_query_params(url: str):
 
 # Module-level flag: only warn once per process about stale OPENAI_BASE_URL.
 _stale_base_url_warned = False
+_AUX_RUNTIME_OVERRIDE = contextvars.ContextVar("aux_runtime_override", default={})
 
 _PROVIDER_ALIASES = {
     "google": "gemini",
@@ -1491,6 +1494,9 @@ def _read_main_model() -> str:
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
+    runtime_model = _normalize_main_runtime(None).get("model", "")
+    if runtime_model:
+        return runtime_model
     override = _RUNTIME_MAIN_MODEL
     if isinstance(override, str) and override.strip():
         return override.strip()
@@ -1518,6 +1524,9 @@ def _read_main_provider() -> str:
     Runtime override: see ``_read_main_model`` — same mechanism for the
     provider half of the runtime tuple.
     """
+    runtime_provider = _normalize_main_runtime(None).get("provider", "")
+    if runtime_provider:
+        return runtime_provider
     override = _RUNTIME_MAIN_PROVIDER
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
@@ -1805,10 +1814,36 @@ _AUTO_PROVIDER_LABELS = {
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode")
 
 
+def _runtime_override() -> dict:
+    value = _AUX_RUNTIME_OVERRIDE.get({})
+    return value if isinstance(value, dict) else {}
+
+
+@contextlib.contextmanager
+def auxiliary_runtime_override(
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    auxiliary_runtime: Optional[Dict[str, Any]] = None,
+):
+    """Temporarily override main/auxiliary runtime config for this context."""
+    current = _runtime_override()
+    merged = dict(current)
+    if isinstance(main_runtime, dict):
+        merged["main"] = dict(main_runtime)
+    if isinstance(auxiliary_runtime, dict):
+        merged["auxiliary"] = dict(auxiliary_runtime)
+    token = _AUX_RUNTIME_OVERRIDE.set(merged)
+    try:
+        yield
+    finally:
+        _AUX_RUNTIME_OVERRIDE.reset(token)
+
+
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, str]:
     """Return a sanitized copy of a live main-runtime override."""
     if not isinstance(main_runtime, dict):
-        return {}
+        current = _runtime_override().get("main")
+        main_runtime = current if isinstance(current, dict) else {}
     normalized: Dict[str, str] = {}
     for field in _MAIN_RUNTIME_FIELDS:
         value = main_runtime.get(field)
@@ -3801,6 +3836,7 @@ def _resolve_task_provider_model(
     cfg_api_key = None
     cfg_api_mode = None
 
+    runtime_aux = _runtime_override().get("auxiliary")
     if task:
         task_config = _get_auxiliary_task_config(task)
         cfg_provider = str(task_config.get("provider", "")).strip() or None
@@ -3808,6 +3844,12 @@ def _resolve_task_provider_model(
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
+        if isinstance(runtime_aux, dict):
+            cfg_provider = str(runtime_aux.get("provider") or cfg_provider or "").strip() or None
+            cfg_model = str(runtime_aux.get("model") or cfg_model or "").strip() or None
+            cfg_base_url = str(runtime_aux.get("base_url") or cfg_base_url or "").strip() or None
+            cfg_api_key = str(runtime_aux.get("api_key") or cfg_api_key or "").strip() or None
+            cfg_api_mode = str(runtime_aux.get("api_mode") or cfg_api_mode or "").strip() or None
 
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode
